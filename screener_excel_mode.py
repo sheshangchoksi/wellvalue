@@ -668,11 +668,14 @@ def calculate_screener_ddm_valuation(financials, num_shares, required_return=0.1
             'total_intrinsic_value': 0
         }
     
-    # Calculate historical dividend growth rate (only for non-zero consecutive years)
+    # extract_screener_financials() returns every list NEWEST FIRST. Year-over-year growth must be
+    # computed in chronological (oldest -> newest) order; the old loop ran on the newest-first list,
+    # which inverted the sign of every growth rate (rising dividends looked like falling ones).
+    dividends_chrono = list(reversed(dividends))
     historical_growth_rates = []
-    for i in range(1, len(dividends)):
-        if dividends[i-1] > 0 and dividends[i] > 0:
-            growth = (dividends[i] - dividends[i-1]) / dividends[i-1]
+    for i in range(1, len(dividends_chrono)):
+        if dividends_chrono[i-1] > 0 and dividends_chrono[i] > 0:
+            growth = (dividends_chrono[i] - dividends_chrono[i-1]) / dividends_chrono[i-1]
             historical_growth_rates.append(growth)
     
     avg_historical_growth = np.mean(historical_growth_rates) if historical_growth_rates else growth_rate
@@ -685,8 +688,9 @@ def calculate_screener_ddm_valuation(financials, num_shares, required_return=0.1
     else:  # Use historical growth
         final_growth_rate = avg_historical_growth
     
-    # Use latest non-zero dividend (in LACS)
-    latest_dividend = next((d for d in reversed(dividends) if d > 0), 0)
+    # Use latest non-zero dividend (in LACS). The list is newest-first, so scan it as-is
+    # (the old reversed() scan returned the OLDEST non-zero dividend).
+    latest_dividend = next((d for d in dividends if d > 0), 0)
     
     if latest_dividend == 0:
         return {
@@ -702,11 +706,11 @@ def calculate_screener_ddm_valuation(financials, num_shares, required_return=0.1
     
     # Gordon Growth Model: P = D1 / (r - g)
     # D1 = D0 * (1 + g)
-    if required_return <= avg_historical_growth:
+    if required_return <= final_growth_rate:
         return {
             'model': 'DDM (Gordon Growth Model)',
             'status': 'Invalid',
-            'message': f'Required return ({required_return*100:.1f}%) must be greater than growth rate ({avg_historical_growth*100:.1f}%)',
+            'message': f'Required return ({required_return*100:.1f}%) must be greater than growth rate ({final_growth_rate*100:.1f}%)',
             'value_per_share': 0,
             'total_intrinsic_value': 0,
             'latest_dps': dps,
@@ -714,10 +718,12 @@ def calculate_screener_ddm_valuation(financials, num_shares, required_return=0.1
         }
     
     # Calculate next year's expected dividend
-    d1 = dps * (1 + avg_historical_growth)
+    # final_growth_rate = the user's override if given, else the historical average
+    # (it was computed above but never used, so the override was silently ignored)
+    d1 = dps * (1 + final_growth_rate)
     
     # Intrinsic value per share
-    intrinsic_value_per_share = d1 / (required_return - avg_historical_growth)
+    intrinsic_value_per_share = d1 / (required_return - final_growth_rate)
     
     # Total intrinsic value
     total_intrinsic_value = intrinsic_value_per_share * num_shares
@@ -729,7 +735,7 @@ def calculate_screener_ddm_valuation(financials, num_shares, required_return=0.1
         'latest_dps': dps,
         'num_shares': num_shares,
         'historical_growth_rate': avg_historical_growth,
-        'assumed_growth_rate': avg_historical_growth,
+        'assumed_growth_rate': final_growth_rate,
         'required_return': required_return,
         'expected_next_dividend': d1,
         'value_per_share': intrinsic_value_per_share,
@@ -788,10 +794,12 @@ def calculate_screener_rim_valuation(financials, num_shares, required_return=0.1
         avg_historical_roe = np.mean(roe_values) if roe_values else 0.15  # Default 15%
         
         # Calculate earnings growth rate
+        # Lists are NEWEST FIRST; compute growth in chronological order (the old loop inverted the sign).
+        _np_chrono = list(reversed(financials['net_profit']))
         earnings_growth_rates = []
-        for i in range(1, len(financials['net_profit'])):
-            if financials['net_profit'][i-1] > 0:
-                growth = (financials['net_profit'][i] - financials['net_profit'][i-1]) / financials['net_profit'][i-1]
+        for i in range(1, len(_np_chrono)):
+            if _np_chrono[i-1] > 0:
+                growth = (_np_chrono[i] - _np_chrono[i-1]) / _np_chrono[i-1]
                 earnings_growth_rates.append(growth)
         avg_earnings_growth = np.mean(earnings_growth_rates) if earnings_growth_rates else 0.08  # Default 8%
     else:
@@ -809,7 +817,12 @@ def calculate_screener_rim_valuation(financials, num_shares, required_return=0.1
     for year in range(1, projection_years + 1):
         # Project next year's book value and earnings
         next_book_value = projected_book_values[-1] * (1 + avg_earnings_growth)
-        next_earnings = projected_earnings[-1] * (1 + avg_earnings_growth)
+        if assumed_roe is not None and assumed_roe > 0:
+            # User-supplied ROE: next year's earnings = ROE x opening book value (previously the
+            # override was computed but never used, so it had no effect on the valuation)
+            next_earnings = projected_book_values[-1] * assumed_roe
+        else:
+            next_earnings = projected_earnings[-1] * (1 + avg_earnings_growth)
         
         # Calculate residual income
         # RI = Net Income - (Required Return × Book Value)
@@ -1014,8 +1027,10 @@ def display_screener_rim_results(rim_results):
     terminal_ri_pv = rim_results.get('terminal_ri_pv', rim_results.get('pv_terminal', 0))
     
     # Convert to unified format if needed
+    _already_lacs = False
     if not projections and residual_incomes:
-        # Build projections from arrays (Screener format)
+        # Build projections from arrays (Screener format) - these are ALREADY in Lacs
+        _already_lacs = True
         projections = []
         for i in range(len(residual_incomes)):
             projections.append({
@@ -1036,8 +1051,10 @@ def display_screener_rim_results(rim_results):
             ri_year = proj.get('residual_income', 0)
             pv_ri_year = proj.get('pv_ri', 0)
             
-            # Convert to Lacs if needed
-            if abs(ri_year) > 1000000:  # If in Rupees, convert to Lacs
+            # Convert to Lacs if needed. Only for the legacy 'projections' format: the Screener arrays
+            # are already Lacs, and this magnitude test would wrongly divide a large company's
+            # residual income (> 10,00,000 Lacs = Rs 10,000 Cr) by 100000.
+            if (not _already_lacs) and abs(ri_year) > 1000000:  # If in Rupees, convert to Lacs
                 ri_year = ri_year / 100000
                 pv_ri_year = pv_ri_year / 100000
             
@@ -1204,8 +1221,10 @@ TERMINAL VALUE CONTRIBUTION: ₹{terminal_ri_pv / 100000:.2f} Lacs
     st.markdown("### 💰 Fair Value Build-Up")
     
     bv_per_share = bv * 100000 / num_shares
-    pv_ri_per_share = sum_pv_ri / num_shares
-    tv_per_share = terminal_ri_pv / num_shares
+    # sum_pv_ri and terminal_ri_pv are in LACS (like bv) -> x100000 to rupees before dividing by shares.
+    # Without this the chart showed PV(RI) and TV as ~0 and a total far below the headline value.
+    pv_ri_per_share = sum_pv_ri * 100000 / num_shares
+    tv_per_share = terminal_ri_pv * 100000 / num_shares
     
     # VISUAL: Waterfall Chart for Value Build-up
     st.markdown("#### 📊 Visual: Fair Value Waterfall")
@@ -1331,9 +1350,9 @@ FAIR VALUE PER SHARE                      = ₹{value_per_share:.2f}
     with col_buildup2:
         st.markdown("**Total Equity Value:**")
         st.write(f"• Book Value: ₹{bv:.2f} Lacs")
-        st.write(f"• PV of RI (5Y): ₹{sum_pv_ri/100000:.2f} Lacs")
-        st.write(f"• Terminal Value: ₹{terminal_ri_pv/100000:.2f} Lacs")
-        st.write(f"• **Total**: ₹{rim_results.get('total_equity_value', 0)/100000:.2f} Lacs")
+        st.write(f"• PV of RI (5Y): ₹{sum_pv_ri:.2f} Lacs")  # already Lacs (was /100000 again)
+        st.write(f"• Terminal Value: ₹{terminal_ri_pv:.2f} Lacs")  # already Lacs (was /100000 again)
+        st.write(f"• **Total**: ₹{rim_results.get('total_equity_value', rim_results.get('total_intrinsic_value', 0)):.2f} Lacs")  # key is total_intrinsic_value, already Lacs
         st.write("")
         st.write(f"÷ Shares: {num_shares:,.0f}")
         st.success(f"**= ₹{value_per_share:.2f} per share**")

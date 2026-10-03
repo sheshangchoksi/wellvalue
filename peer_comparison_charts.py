@@ -63,14 +63,24 @@ def fetch_peer_financials(ticker_list, target_ticker=None, exchange_suffix="NS")
                 revenue = abs(financials.loc['Total Revenue', latest_year]) if 'Total Revenue' in financials.index else 0
                 
                 # Operating metrics
-                operating_income = abs(financials.loc['Operating Income', latest_year]) if 'Operating Income' in financials.index else 0
-                net_income = abs(financials.loc['Net Income', latest_year]) if 'Net Income' in financials.index else 0
+                # SIGNED values: abs() here turned a loss-making peer's loss into a profit (positive
+                # margin / ROE) on every chart. NaN -> 0.
+                def _signed(df, label, col):
+                    if label not in df.index:
+                        return 0
+                    v = df.loc[label, col]
+                    return float(v) if pd.notna(v) else 0
+                operating_income = _signed(financials, 'Operating Income', latest_year)
+                net_income = _signed(financials, 'Net Income', latest_year)
                 ebitda = info.get('ebitda', 0)
                 
                 # Balance sheet
                 total_assets = abs(balance_sheet.loc['Total Assets', latest_year]) if 'Total Assets' in balance_sheet.index else 0
-                total_debt = abs(balance_sheet.loc['Long Term Debt', latest_year]) if 'Long Term Debt' in balance_sheet.index else 0
-                equity = abs(balance_sheet.loc['Stockholders Equity', latest_year]) if 'Stockholders Equity' in balance_sheet.index else 0
+                # Total debt = long-term + current debt (it used to be long-term only, understating D/E).
+                total_debt = abs(_signed(balance_sheet, 'Long Term Debt', latest_year)) + \
+                             abs(_signed(balance_sheet, 'Current Debt', latest_year))
+                # Signed equity: negative equity must not be shown as positive (the >0 checks below then yield 0).
+                equity = _signed(balance_sheet, 'Stockholders Equity', latest_year)
                 
                 # Market data
                 market_cap = info.get('marketCap', 0)
@@ -568,14 +578,15 @@ def create_peer_comparison_dashboard(ticker, peer_tickers_str, unlisted_data=Non
     if unlisted_data:
         st.info("🔧 Creating synthetic data for unlisted company from financial inputs...")
         
-        # Extract data from unlisted_data (values are in Lacs)
-        revenue_lacs = unlisted_data['revenue'][-1] if 'revenue' in unlisted_data else 0
-        ebitda_lacs = unlisted_data['ebitda'][-1] if 'ebitda' in unlisted_data else 0
-        nopat_lacs = unlisted_data['nopat'][-1] if 'nopat' in unlisted_data else 0
-        equity_lacs = unlisted_data['equity'][-1] if 'equity' in unlisted_data else 0
-        st_debt_lacs = unlisted_data['st_debt'][-1] if 'st_debt' in unlisted_data else 0
-        lt_debt_lacs = unlisted_data['lt_debt'][-1] if 'lt_debt' in unlisted_data else 0
-        fixed_assets_lacs = unlisted_data['fixed_assets'][-1] if 'fixed_assets' in unlisted_data else 0
+        # Extract data from unlisted_data (values are in Lacs). Lists are NEWEST FIRST (index 0 = latest
+        # year); [-1] used to pick the OLDEST year. (No caller passes unlisted_data today.)
+        revenue_lacs = unlisted_data['revenue'][0] if 'revenue' in unlisted_data else 0
+        ebitda_lacs = unlisted_data['ebitda'][0] if 'ebitda' in unlisted_data else 0
+        nopat_lacs = unlisted_data['nopat'][0] if 'nopat' in unlisted_data else 0
+        equity_lacs = unlisted_data['equity'][0] if 'equity' in unlisted_data else 0
+        st_debt_lacs = unlisted_data['st_debt'][0] if 'st_debt' in unlisted_data else 0
+        lt_debt_lacs = unlisted_data['lt_debt'][0] if 'lt_debt' in unlisted_data else 0
+        fixed_assets_lacs = unlisted_data['fixed_assets'][0] if 'fixed_assets' in unlisted_data else 0
         
         # Keep values in Lacs (same unit as peer data)
         revenue = revenue_lacs

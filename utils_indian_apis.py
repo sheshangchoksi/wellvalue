@@ -469,7 +469,7 @@ def fetch_screener_financials(symbol, num_years=5):
                     if kw.lower() in label:
                         values = []
                         for cell in cells[1:]:
-                            raw = cell.get_text(strip=True).replace(',', '').replace('\xa0', '')
+                            raw = cell.get_text(strip=True).replace(',', '').replace('\xa0', '').replace('%', '')
                             try:
                                 values.append(float(raw))
                             except (ValueError, TypeError):
@@ -516,6 +516,16 @@ def fetch_screener_financials(symbol, num_years=5):
         raw_tax_pct = parse_row(pl_table, ['tax %'])
         raw_net_profit = parse_row(pl_table, ['net profit'])
         raw_eps = parse_row(pl_table, ['eps in rs', 'eps'])
+
+        # The annual P&L ends with a 'TTM' column; the Balance Sheet has none. pad() aligns from the
+        # RIGHT, so with TTM present every P&L year was paired with the PREVIOUS year's balance sheet.
+        # Drop TTM so both statements are plain fiscal years and line up one-to-one.
+        _first_tr = pl_table.find('tr')
+        _hdr = [c.get_text(strip=True) for c in _first_tr.find_all(['td', 'th'])] if _first_tr else []
+        if _hdr and _hdr[-1].strip().upper() == 'TTM':
+            raw_revenue, raw_interest, raw_expenses, raw_depreciation, raw_pbt, raw_tax_pct, raw_net_profit, raw_eps = (
+                v[:-1] if v else v for v in (raw_revenue, raw_interest, raw_expenses, raw_depreciation,
+                                             raw_pbt, raw_tax_pct, raw_net_profit, raw_eps))
         
         # Parse rows from Balance Sheet - FIXED to actually find the data
         # The issue: Screener uses different exact labels, need to be more flexible
@@ -692,9 +702,7 @@ def fetch_screener_financials(symbol, num_years=5):
             ebit_val = ebitda_val - dep_val
             
             # Tax rate
-            t_rate = tax_pct[i]
-            if t_rate > 1:
-                t_rate = t_rate / 100.0
+            t_rate = tax_pct[i] / 100.0  # Screener's "Tax %" row is always a percent
             t_rate = max(0.0, min(t_rate, 0.40))
             tax_val = pbt_val * t_rate
             nopat_val = ebit_val * (1 - t_rate)

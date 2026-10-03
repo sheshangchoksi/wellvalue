@@ -101,13 +101,14 @@ def calculate_eps_from_screener(balance_sheet_df, pnl_df, num_years=10):
         if not years:
             return None
         
-        # Calculate EPS (Net Profit is in Cr, Shares is in Cr)
-        eps_values = [np / shares if shares > 0 else 0 for np, shares in zip(net_profits, shares_outstanding)]
+        # EPS (Rs) = Net Profit (Crores) x 1e7 / Shares (ABSOLUTE count in the Screener sheet).
+        # It used to divide Crores by the raw share count, giving EPS ~ 1e-6 instead of ~ 16.
+        eps_values = [(npf * 10_000_000) / shares if shares > 0 else 0 for npf, shares in zip(net_profits, shares_outstanding)]
         
         df = pd.DataFrame({
             'Year': years,
             'Net_Profit_Cr': net_profits,
-            'Shares_Cr': shares_outstanding,
+            'Shares': shares_outstanding,
             'EPS': eps_values
         })
         
@@ -361,8 +362,10 @@ def get_stock_comparison_data_listed(ticker, company_name, financials, num_years
         # Extract Revenue from financials
         revenue_df = None
         if 'years' in financials and 'revenue' in financials:
-            years = financials['years'][-num_years:]
-            revenues = financials['revenue'][-num_years:]
+            # Lists are NEWEST FIRST and in LACS: take the latest N, put them in chronological order,
+            # and convert Lacs -> Crores (1 Cr = 100 Lacs) to match the 'Revenue_Cr' label.
+            years = list(reversed(financials['years'][:num_years]))
+            revenues = [r / 100.0 for r in reversed(financials['revenue'][:num_years])]
             revenue_df = pd.DataFrame({
                 'Year': years,
                 'Revenue_Cr': revenues
@@ -375,8 +378,8 @@ def get_stock_comparison_data_listed(ticker, company_name, financials, num_years
             # financials dict has 'nopat' which is close to net income
             if 'years' in financials and 'nopat' in financials:
                 # Get net income (using NOPAT as proxy)
-                years = financials['years'][-num_years:]
-                nopat_values = financials['nopat'][-num_years:]  # In Crores
+                years = list(reversed(financials['years'][:num_years]))
+                nopat_values = list(reversed(financials['nopat'][:num_years]))  # In LACS, newest-first -> chronological
                 
                 # Get shares from Yahoo Finance
                 stock = yf.Ticker(ticker)
@@ -384,8 +387,9 @@ def get_stock_comparison_data_listed(ticker, company_name, financials, num_years
                 shares = info.get('sharesOutstanding', 0)  # Actual share count
                 
                 if shares > 0:
-                    # Convert: (NOPAT in Crores * 10,000,000) / Shares = EPS in Rupees
-                    eps_values = [(nopat * 10000000) / shares for nopat in nopat_values]
+                    # Convert: (NOPAT in Lacs * 100,000) / Shares = EPS-proxy in Rupees
+                    # (was x 10,000,000 = the CRORE factor, overstating the series 100x)
+                    eps_values = [(nopat * 100000) / shares for nopat in nopat_values]
                     
                     eps_df = pd.DataFrame({
                         'Year': years,

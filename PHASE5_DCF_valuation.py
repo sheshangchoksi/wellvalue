@@ -203,12 +203,14 @@ except ImportError as e:
             # Try to extract current price from page
             current_price = 0
             try:
-                # Look for price in the top metrics section
-                price_elem = soup.find('span', class_='number')
-                if price_elem:
-                    price_text = price_elem.get_text(strip=True).replace(',', '').replace('₹', '').strip()
-                    current_price = float(price_text)
-                    st.write(f"✓ Found Current Price: ₹{current_price:.2f}")
+                # Read the LABELLED 'Current Price' ratio. The first span.number on the page is the
+                # Market Cap (in Crores), which this used to return as the "price".
+                for _li in soup.select('#top-ratios li'):
+                    _nm, _vl = _li.find(class_='name'), _li.find(class_='number')
+                    if _nm and _vl and 'current price' in _nm.get_text(strip=True).lower():
+                        current_price = float(_vl.get_text(strip=True).replace(',', ''))
+                        st.write(f"✓ Found Current Price: ₹{current_price:.2f}")
+                        break
             except:
                 pass
             
@@ -315,12 +317,19 @@ except ImportError as e:
                         if kw.lower() in label:
                             values = []
                             for cell in cells[1:]:
-                                raw = cell.get_text(strip=True).replace(',', '').replace('\xa0', '')
+                                raw = cell.get_text(strip=True).replace(',', '').replace('\xa0', '').replace('%', '')
                                 try:
                                     val = float(raw)
                                     values.append(val)
                                 except:
                                     values.append(0.0)
+                            
+                            # The annual P&L ends with a 'TTM' column that the Balance Sheet lacks; pad()
+                            # aligns from the right, so keeping it shifted every P&L year one year off.
+                            _first_tr = table.find('tr')
+                            _hdr = [c.get_text(strip=True) for c in _first_tr.find_all(['td', 'th'])] if _first_tr else []
+                            if _hdr and _hdr[-1].strip().upper() == 'TTM' and values:
+                                values = values[:-1]
                             
                             # Only return if we found actual non-zero values
                             if values and any(v != 0 for v in values):
@@ -1499,7 +1508,7 @@ def calculate_residual_income_model(financials, shares, cost_of_equity, terminal
         # Terminal value of residual income
         if cost_of_equity / 100 > terminal_growth / 100:
             terminal_ri = projections[-1]['residual_income'] * (1 + terminal_growth / 100) / (cost_of_equity / 100 - terminal_growth / 100)
-            pv_terminal_ri = terminal_ri / ((1 + cost_of_equity / 100) ** 5)
+            pv_terminal_ri = terminal_ri / ((1 + cost_of_equity / 100) ** projection_years)  # was hard-coded ** 5
         else:
             pv_terminal_ri = 0
         
@@ -1535,7 +1544,7 @@ def calculate_residual_income_model(financials, shares, cost_of_equity, terminal
             'technical_details': str(e)
         }
 
-def calculate_dividend_discount_model(financials, shares, cost_of_equity, ticker=None, div_growth_override=None, payout_ratio_override=None, dcf_projections=None):
+def calculate_dividend_discount_model(financials, shares, cost_of_equity, ticker=None, div_growth_override=None, payout_ratio_override=None, dcf_projections=None, exchange_suffix="NS"):
     """
     Dividend Discount Model (Gordon Growth Model)
     Value = D1 / (Ke - g)
@@ -1555,21 +1564,31 @@ def calculate_dividend_discount_model(financials, shares, cost_of_equity, ticker
             try:
                 stock = get_cached_ticker(get_ticker_with_exchange(ticker, exchange_suffix))
                 dividends_hist = stock.dividends
-                
+
                 if not dividends_hist.empty and len(dividends_hist) > 0:
-                    # Get annual dividends for last 3 years
-                    dividends_by_year = dividends_hist.resample('Y').sum()
+                    # Annual dividends. 'Y' was removed in pandas 3 ('YE' is the year-end alias; older
+                    # pandas only knows 'Y'), so try the new alias first.
+                    try:
+                        dividends_by_year = dividends_hist.resample('YE').sum()
+                    except ValueError:
+                        dividends_by_year = dividends_hist.resample('Y').sum()
+                    # The last bucket is the CURRENT, incomplete calendar year (often 0 or a partial
+                    # payment). Drop it when at least 2 complete years remain.
+                    _complete = dividends_by_year[dividends_by_year.index.year < pd.Timestamp.today().year]
+                    if len(_complete) >= 2:
+                        dividends_by_year = _complete
                     if len(dividends_by_year) >= 2:
+                        # resample() returns CHRONOLOGICAL order: [oldest ... newest]
                         recent_divs = dividends_by_year[-3:].values
                         actual_dividends = recent_divs.tolist()
-                        
-                        # Calculate growth rate using CAGR (data is newest to oldest)
+
+                        # Growth = CAGR from oldest (index 0) to newest (index -1). The old code treated
+                        # index 0 as the newest, which inverted the sign (rising dividends -> negative growth).
                         if len(actual_dividends) >= 2 and actual_dividends[-1] > 0 and actual_dividends[0] > 0:
                             num_years = len(actual_dividends) - 1
-                            # Start = oldest (last), End = newest (first)
-                            div_growth_calculated = ((actual_dividends[0] / actual_dividends[-1]) ** (1 / num_years) - 1) * 100
+                            div_growth_calculated = ((actual_dividends[-1] / actual_dividends[0]) ** (1 / num_years) - 1) * 100
                             div_growth_calculated = max(-50, min(div_growth_calculated, 150))  # Allow up to 150%
-                        
+
                         # Calculate payout ratio from actual data - USE NEWEST nopat (index 0)
                         latest_div = actual_dividends[-1] if actual_dividends else 0
                         latest_ni = financials['nopat'][0] * 100000
@@ -1577,7 +1596,8 @@ def calculate_dividend_discount_model(financials, shares, cost_of_equity, ticker
                             payout_ratio_calculated = (latest_div * shares) / latest_ni
                             payout_ratio_calculated = max(0.1, min(payout_ratio_calculated, 0.9))
             except Exception as e:
-                pass
+                actual_dividends = []
+                st.caption(f"ℹ️ DDM: actual dividend history unavailable ({type(e).__name__}: {e}); using payout-ratio estimate instead.")
         
         # Calculate average earnings
         net_incomes = []
@@ -1759,6 +1779,7 @@ def calculate_relative_valuation(ticker, financials, shares, peer_tickers=None, 
         # Get stock info with rate limit handling
         max_retries = 3
         retry_delay = 2  # seconds
+        current_price = 0  # was only assigned inside `if info:` -> UnboundLocalError when Yahoo returns empty info
         
         for attempt in range(max_retries):
             try:
@@ -2857,9 +2878,13 @@ def create_fcff_projection_chart(projections):
     
     return fig
 
-def create_sensitivity_heatmap(projections, wacc_range, g_range, num_shares):
-    """Create sensitivity analysis heatmap"""
-    last_fcff = projections['fcff'][-1]
+def create_sensitivity_heatmap(projections, wacc_range, g_range, num_shares, net_debt=0, terminal_fcff=None):
+    """Create sensitivity analysis heatmap (fair value per share = (EV - net debt) / shares).
+
+    net_debt: Lacs. Without it the chart showed ENTERPRISE value per share under a 'Fair Value' label.
+    terminal_fcff: the terminal FCFF the DCF actually used (differs from projections['fcff'][-1] when
+    FCFF recovery fired); falls back to the last projected FCFF."""
+    last_fcff = terminal_fcff if terminal_fcff is not None else projections['fcff'][-1]
     n = len(projections['fcff'])
     
     # Create matrix
@@ -2879,7 +2904,7 @@ def create_sensitivity_heatmap(projections, wacc_range, g_range, num_shares):
                     sum_pv_fcff = sum([projections['fcff'][i] / ((1 + w/100) ** (i+1)) for i in range(len(projections['fcff']))])
                     
                     ev = sum_pv_fcff + pv_tv
-                    eq_val = ev * 100000
+                    eq_val = (ev - net_debt) * 100000
                     fv = eq_val / num_shares if num_shares > 0 else 0
                     row.append(fv)
                 except:
@@ -5516,8 +5541,13 @@ def _run_scenario_point(financials, wc_metrics, years, tax_rate,
             interest_rate_override=interest_rate_override,
             working_capital_pct_override=wc_pct
         )
+        # The DCF reads debt from wacc_details['debt'] (default 0). Passing only wacc/tax_rate made every
+        # scenario / tornado / Monte-Carlo valuation ignore the company's debt, so 'Base Case' did not
+        # reconcile with the headline DCF. Use the same debt definition as calculate_wacc().
+        _std = financials['st_debt'][0] if financials['st_debt'][0] > 0 else 0
+        _ltd = financials['lt_debt'][0] if financials['lt_debt'][0] > 0 else 0
         val, err = calculate_dcf_valuation(
-            proj, {'wacc': wacc_pct, 'tax_rate': tax_rate}, terminal_growth,
+            proj, {'wacc': wacc_pct, 'tax_rate': tax_rate, 'debt': _std + _ltd}, terminal_growth,
             num_shares, cash_balance, manual_discount_rate=wacc_pct
         )
         return proj, drv, val, err
@@ -8714,7 +8744,8 @@ def main():
                         financials, shares, cost_of_equity,
                         ticker=ticker,
                         div_growth_override=div_growth_bank if div_growth_bank != 0 else None,
-                        payout_ratio_override=payout_ratio_bank if payout_ratio_bank != 0 else None
+                        payout_ratio_override=payout_ratio_bank if payout_ratio_bank != 0 else None,
+                        exchange_suffix=exchange_suffix
                     )
                 
                     pb_roe_model = calculate_pb_roe_valuation(
@@ -9442,7 +9473,8 @@ def main():
                     ticker=ticker,
                     div_growth_override=ddm_dividend_growth_override if ddm_dividend_growth_override > 0 else None,
                     payout_ratio_override=ddm_payout_ratio_override if ddm_payout_ratio_override > 0 else None,
-                    dcf_projections=projections  # ✅ PASS EXISTING PROJECTIONS - NO DUPLICATION!
+                    dcf_projections=projections,  # ✅ PASS EXISTING PROJECTIONS - NO DUPLICATION!
+                    exchange_suffix=exchange_suffix
                 )
                 if ddm_result and isinstance(ddm_result, dict) and 'value_per_share' in ddm_result:
                     st.success(f"✅ DDM Fair Value: {_ticker_csym}{ddm_result['value_per_share']:.2f}")
@@ -9923,7 +9955,7 @@ def main():
                     st.write(f"FCFF (Year {projection_years_listed + 1}) = **{_ticker_csym} {terminal_fcff * (1 + terminal_growth/100):.2f} Lacs**")
                 
                     st.write(f"\nTerminal Value = FCFF{projection_years_listed + 1} / (WACC - g)")
-                    st.write(f"Terminal Value = {_ticker_csym} {projections['fcff'][-1] * (1 + terminal_growth/100):.2f} / ({wacc_details['wacc']:.2f}% - {terminal_growth}%)")
+                    st.write(f"Terminal Value = {_ticker_csym} {terminal_fcff * (1 + terminal_growth/100):.2f} / ({wacc_details['wacc']:.2f}% - {terminal_growth}%)")
                     st.write(f"**Terminal Value = {_ticker_csym} {valuation['terminal_value']:.2f} Lacs**")
                 
                     st.write(f"\nPV(Terminal Value) = TV / (1 + WACC)^{projection_years_listed}")
@@ -10016,7 +10048,9 @@ def main():
                         g_range = np.array([terminal_growth])
                 
                     # Interactive heatmap
-                    st.plotly_chart(create_sensitivity_heatmap(projections, wacc_range, g_range, shares),
+                    st.plotly_chart(create_sensitivity_heatmap(projections, wacc_range, g_range, shares,
+                                                              net_debt=valuation['net_debt'],
+                                                              terminal_fcff=valuation.get('adjusted_terminal_fcff')),
                                   use_container_width=True)
                 
                     # Traditional table below
@@ -10030,10 +10064,10 @@ def main():
                                     row_data[f"g={g_val:.1f}%"] = "N/A"
                                 else:
                                     try:
-                                        fcff_n_plus_1 = projections['fcff'][-1] * (1 + g_val / 100)
+                                        fcff_n_plus_1 = valuation.get('adjusted_terminal_fcff', projections['fcff'][-1]) * (1 + g_val / 100)
                                         tv = fcff_n_plus_1 / ((w / 100) - (g_val / 100))
                                         pv_tv = tv / ((1 + w / 100) ** projection_years_listed)
-                                        ev = valuation['sum_pv_fcff'] + pv_tv
+                                        ev = sum(_f / ((1 + w / 100) ** (_i + 1)) for _i, _f in enumerate(projections['fcff'])) + pv_tv  # explicit-period PV re-discounted at THIS grid WACC (was stuck at the base WACC)
                                         eq_val = ev - valuation['net_debt']
                                         eq_val_rupees = eq_val * 100000
                                         fv = eq_val_rupees / shares if shares > 0 else 0
@@ -12052,7 +12086,7 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
                             st.markdown("---")
                             st.subheader("Terminal Value Calculation")
                             
-                            fcff_final = projections['fcff'][-1]
+                            fcff_final = valuation.get('adjusted_terminal_fcff', projections['fcff'][-1])
                             fcff_n_plus_1 = fcff_final * (1 + terminal_growth / 100)
                             
                             tv_calc = pd.DataFrame({
@@ -12167,10 +12201,10 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
                                         row_data[f"g={g_val:.1f}%"] = "N/A"
                                     else:
                                         try:
-                                            fcff_n_plus_1 = projections['fcff'][-1] * (1 + g_val / 100)
+                                            fcff_n_plus_1 = valuation.get('adjusted_terminal_fcff', projections['fcff'][-1]) * (1 + g_val / 100)
                                             tv = fcff_n_plus_1 / ((w / 100) - (g_val / 100))
                                             pv_tv = tv / ((1 + w / 100) ** projection_years)
-                                            ev = valuation['sum_pv_fcff'] + pv_tv
+                                            ev = sum(_f / ((1 + w / 100) ** (_i + 1)) for _i, _f in enumerate(projections['fcff'])) + pv_tv  # explicit-period PV re-discounted at THIS grid WACC (was stuck at the base WACC)
                                             eq_val = ev - valuation['net_debt']
                                             eq_val_rupees = eq_val * 100000
                                             fv = eq_val_rupees / num_shares if num_shares > 0 else 0
@@ -14226,7 +14260,9 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
                             # Add Sensitivity Heatmap with error handling
                             try:
                                 st.plotly_chart(
-                                    create_sensitivity_heatmap(projections_screener, wacc_range, g_range, num_shares_screener),
+                                    create_sensitivity_heatmap(projections_screener, wacc_range, g_range, num_shares_screener,
+                                                              net_debt=dcf_results_screener['net_debt'],
+                                                              terminal_fcff=dcf_results_screener.get('adjusted_terminal_fcff')),
                                     use_container_width=True
                                 )
                             except Exception as e:

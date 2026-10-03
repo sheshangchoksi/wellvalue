@@ -256,7 +256,7 @@ def _parse_row(table, keywords):
             if kw.lower() in label:
                 values = []
                 for cell in cells[1:]:
-                    raw = cell.get_text(strip=True).replace(",", "").replace("\xa0", "")
+                    raw = cell.get_text(strip=True).replace(",", "").replace("\xa0", "").replace("%", "")
                     try:
                         values.append(float(raw))
                     except (ValueError, TypeError):
@@ -341,7 +341,7 @@ def _extract_shares_from_market_cap(soup, price: Optional[float]) -> Optional[in
 
 
 def _parse_screener_page(soup, num_years: int):
-    """Returns (financials_dict_or_None, shares, company_name, reason_if_failed).
+    """Returns (financials_dict_or_None, shares, company_name, shares_source, reason_if_failed).
     financials_dict is None (not an empty-but-present dict) when the page
     had no usable P&L/BS data — this is the signal the caller uses to decide
     whether to retry with the standalone URL."""
@@ -352,11 +352,19 @@ def _parse_screener_page(soup, num_years: int):
     bs_table = _find_screener_section_table(soup, "balance-sheet", ["balance", "sheet"], must_be_annual=False)
 
     if pl_table is None or bs_table is None:
-        return None, 0, company_name, (
+        return None, 0, company_name, "", (
             "Could not confidently locate the annual Profit & Loss / Balance Sheet tables "
             "(section anchors missing and heading-based search either found nothing or "
             "matched what looks like the Quarterly Results table instead of annual data)."
         )
+
+    # The annual P&L ends with a 'TTM' column; the Balance Sheet has none. _pad() aligns lists from the
+    # RIGHT, so with TTM present every P&L year was paired with the PREVIOUS year's balance sheet.
+    # Drop TTM so both statements are plain fiscal years (Mar-YYYY) and line up one-to-one.
+    _pl_headers = _table_header_years(pl_table)
+    _has_ttm = bool(_pl_headers) and _pl_headers[-1].strip().upper() == "TTM"
+    def _annual(vals):
+        return vals[:-1] if (_has_ttm and vals) else vals
 
     raw_revenue = _parse_row(pl_table, ["revenue", "sales"])
     raw_interest = _parse_row(pl_table, ["interest"])
@@ -366,12 +374,15 @@ def _parse_screener_page(soup, num_years: int):
     raw_tax_pct = _parse_row(pl_table, ["tax %"])
     raw_net_profit = _parse_row(pl_table, ["net profit"])
     raw_eps = _parse_row(pl_table, ["eps in rs", "eps"])
+    raw_revenue, raw_interest, raw_expenses, raw_depreciation, raw_pbt, raw_tax_pct, raw_net_profit, raw_eps = (
+        _annual(v) for v in (raw_revenue, raw_interest, raw_expenses, raw_depreciation, raw_pbt,
+                             raw_tax_pct, raw_net_profit, raw_eps))
 
     # THE KEY CHECK: consolidated URL returned HTTP 200 but has no real
     # revenue data (e.g. DAVANGERE-style single-entity companies) → treat as
     # a failed parse so the caller retries standalone.
     if not raw_revenue or all(v == 0 for v in raw_revenue):
-        return None, 0, company_name, "P&L table found but Revenue/Sales row is empty or all-zero"
+        return None, 0, company_name, "", "P&L table found but Revenue/Sales row is empty or all-zero"
 
     raw_equity_capital = _safe_parse(bs_table, [["equity capital"], ["equity share capital"], ["share capital"]])
     raw_reserves = _safe_parse(bs_table, [["reserves"], ["reserves and surplus"], ["other equity"]])
@@ -439,9 +450,7 @@ def _parse_screener_page(soup, num_years: int):
                 cogs_val = 0.0
                 opex_val = rev - ebitda_val
         ebit_val = ebitda_val - dep_val
-        t_rate = tax_pct[i]
-        if t_rate > 1:
-            t_rate = t_rate / 100.0
+        t_rate = tax_pct[i] / 100.0  # Screener's "Tax %" row is always a percent
         t_rate = max(0.0, min(t_rate, 0.40))
         tax_val = pbt_val * t_rate
         nopat_val = ebit_val * (1 - t_rate)
@@ -752,8 +761,8 @@ def render_bulk_valuation_ui(
 
                 row.status = "success"
                 row.fair_value_per_share = valuation.get("fair_value_per_share")
-                row.enterprise_value_cr = ensure_valid_number(valuation.get("enterprise_value", 0)) / 10.0
-                row.equity_value_cr = ensure_valid_number(valuation.get("equity_value", 0)) / 10.0
+                row.enterprise_value_cr = ensure_valid_number(valuation.get("enterprise_value", 0)) / CR_TO_LAC  # Lacs -> Cr (1 Cr = 100 Lacs; was /10)
+                row.equity_value_cr = ensure_valid_number(valuation.get("equity_value", 0)) / CR_TO_LAC  # Lacs -> Cr (1 Cr = 100 Lacs; was /10)
                 row.wacc_pct = wacc_details.get("wacc")
                 if row.current_price and row.fair_value_per_share:
                     row.upside_pct = (row.fair_value_per_share / row.current_price - 1) * 100
