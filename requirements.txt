@@ -1,0 +1,102 @@
+# Core Web Scraping & Data Fetching
+requests>=2.31.0
+urllib3>=1.26.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+html5lib>=1.1
+
+# Streamlit & Web Framework
+streamlit>=1.28.0
+streamlit-aggrid>=0.3.4
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+xlrd>=2.0.1
+
+# Financial Data
+yfinance>=0.2.32
+nsepy>=0.8
+ta>=0.11.0
+
+# Visualization
+plotly>=5.17.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+# NOTE: kaleido removed — PDF charts now render with matplotlib directly
+# (no headless-Chrome dependency). kaleido's Chrome-fetch step is a known
+# source of build/runtime failures on constrained cloud containers, and
+# nothing in the app calls fig.to_image() anymore.
+
+# Document Generation
+reportlab>=4.0.0
+python-docx>=1.1.0
+python-pptx>=0.6.21
+PyPDF2>=3.0.0
+pdfplumber>=0.10.0
+pypdf>=3.17.0
+
+# Scientific Computing & Statistics
+# NOTE: scipy/scikit-learn/statsmodels NOT imported by any module — excluded
+# NOTE: torch/transformers/numba/triton NOT imported by any module — excluded (caused segfault on Streamlit Cloud CPU containers)
+
+# Database
+sqlalchemy>=2.0.0
+
+# Utilities
+pytz>=2023.3
+python-dateutil>=2.8.0
+qrcode>=7.4.2
+pillow>=10.0.0
+
+# Additional Data Processing
+tabulate>=0.9.0
+python-dotenv>=1.0.0
+cachetools>=5.3.0
+
+# Enhanced Plotly Features
+plotly-express>=0.4.1
+nbformat>=5.9.0
+
+# Financial Calculations
+numpy-financial>=1.0.0
+
+# Data Validation
+pydantic>=2.0.0
+jsonschema>=4.17.0
+
+# Progress Bars & UI
+tqdm>=4.65.0
+rich>=13.0.0
+
+# HTTP & API
+httpx>=0.24.0
+aiohttp>=3.8.0
+
+# Timezone handling
+tzdata>=2023.3
+
+# Configuration
+PyYAML>=6.0
+toml>=0.10.2
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.0
+
+# Code Quality
+black>=23.0.0
+flake8>=6.0.0
+isort>=5.12.0
+
+# Additional Excel Features
+et-xmlfile>=1.1.0
+
+# Enhanced terminal output
+colorama>=0.4.6
+
+# Data export formats
+python-json-logger>=2.0.0
