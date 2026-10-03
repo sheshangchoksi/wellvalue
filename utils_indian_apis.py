@@ -365,11 +365,35 @@ def test_indian_apis():
     print("Test complete!")
 
 
+def _screener_ratio_value(soup, label):
+    """Read a labelled number from Screener's #top-ratios list (e.g. 'Market Cap', 'Current Price').
+    Returns float or None. Never raises."""
+    label_l = label.lower()
+    try:
+        for li in soup.select("#top-ratios li"):
+            name_el = li.find(class_="name")
+            num_el = li.find(class_="number")
+            if name_el and num_el and label_l in name_el.get_text(strip=True).lower():
+                return float(num_el.get_text(strip=True).replace(",", ""))
+    except Exception:
+        pass
+    return None
+
+
+def _shares_from_market_cap(soup):
+    """Shares outstanding = Market Cap (Rs Cr) x 1e7 / Current Price. None if not parseable."""
+    mcap_cr = _screener_ratio_value(soup, "Market Cap")
+    price = _screener_ratio_value(soup, "Current Price")
+    if mcap_cr and price and price > 0:
+        return int(mcap_cr * 10_000_000 / price)
+    return None
+
+
 def fetch_screener_financials(symbol, num_years=5):
     """
     Scrape full financials from screener.in and return in DCF-compatible format
     
-    All values returned in ₹ Lacs (Screener publishes in Crores, so multiply by 10)
+    All values returned in ₹ Lacs (Screener publishes in Crores; 1 Crore = 100 Lacs, so multiply by 100)
     
     Args:
         symbol: NSE/BSE ticker symbol (e.g. 'TATACAP', 'VEDL')
@@ -458,12 +482,22 @@ def fetch_screener_financials(symbol, num_years=5):
         
         print(f"[DEBUG] Found {len(all_tables)} tables total on Screener.in page")
         
-        pl_table = find_table_by_heading(soup, ['profit', 'loss'])
+        def table_in_section(section_id):
+            """Screener wraps each statement in <section id="profit-loss"> / <section id="balance-sheet">.
+            The <h2> heading sits inside a nested <div>, so it is NOT a sibling of the table and
+            find_table_by_heading() fails on the real page - the old fallback then picked the
+            Quarterly Results table as 'P&L' and the real P&L as 'Balance Sheet'."""
+            sec = soup.find(id=section_id)
+            if sec is None:
+                return None
+            return sec.select_one('table.data-table') or sec.find('table')
+        
+        pl_table = table_in_section('profit-loss') or find_table_by_heading(soup, ['profit', 'loss'])
         if pl_table is None and len(all_tables) >= 1:
             pl_table = all_tables[0]
             print(f"[DEBUG] Using first table as P&L (no heading found)")
         
-        bs_table = find_table_by_heading(soup, ['balance', 'sheet'])
+        bs_table = table_in_section('balance-sheet') or find_table_by_heading(soup, ['balance', 'sheet'])
         if bs_table is None and len(all_tables) >= 2:
             bs_table = all_tables[1]
             print(f"[DEBUG] Using second table as Balance Sheet (no heading found)")
@@ -592,15 +626,20 @@ def fetch_screener_financials(symbol, num_years=5):
         cash_vals = pad(raw_cash, n)
         inventory_vals = pad(raw_inventory, n)
         
-        # Derive shares from EPS
-        shares = 0
-        for i in range(n - 1, -1, -1):  # Newest first
-            if eps[i] != 0 and net_profit[i] != 0:
-                shares = int((net_profit[i] * 10_000_000) / eps[i])
-                break
+        # Shares: prefer Market Cap / Current Price (both printed on the page).
+        # Net Profit / EPS overstates shares when there is minority interest
+        # (consolidated Net Profit includes it, EPS does not) - ~19% for RELIANCE.
+        shares = _shares_from_market_cap(soup) or 0
+        if not shares:
+            for i in range(n - 1, -1, -1):  # Newest first
+                if eps[i] != 0 and net_profit[i] != 0:
+                    shares = int((net_profit[i] * 10_000_000) / eps[i])
+                    break
         
-        # Build financials dict (values in Lacs = Crores × 10)
-        CR_TO_LAC = 10.0
+        # Build financials dict (values in Lacs = Crores × 100; 1 Crore = 100 Lacs).
+        # NOTE: this was previously 10.0, which made every monetary figure 10x too small
+        # relative to the (real-unit) share count and therefore per-share values 10x too low.
+        CR_TO_LAC = 100.0
         
         # Year labels: newest → oldest (index 0 = most recent)
         from datetime import datetime as _dt
@@ -680,7 +719,10 @@ def fetch_screener_financials(symbol, num_years=5):
             financials_out['depreciation'].append(dep_val)
             financials_out['ebit'].append(ebit_val)
             financials_out['interest'].append(int_val)
-            financials_out['interest_income'].append(int_val)
+            # Screener does not publish interest income separately. Previously this stored
+            # interest EXPENSE here, which mis-fed classify_business_model(). 0.0 means
+            # 'not available' (the classifier then falls back to an interest-expense proxy).
+            financials_out['interest_income'].append(0.0)
             financials_out['tax'].append(tax_val)
             financials_out['nopat'].append(nopat_val)
             financials_out['fixed_assets'].append(fa_val)

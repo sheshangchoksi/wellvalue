@@ -483,11 +483,14 @@ def extract_screener_financials(df_bs, df_pl, year_cols):
         employee_cost = get_value_from_screener_df(df_pl, 'Employee Cost', year_col)
         selling_admin = get_value_from_screener_df(df_pl, 'Selling and admin', year_col)
         
-        opex = employee_cost + selling_admin
-        
         # Other Income and Expenses - IN CRORES
         other_income = get_value_from_screener_df(df_pl, 'Other Income', year_col)
         other_expenses = get_value_from_screener_df(df_pl, 'Other Expenses', year_col)
+        
+        # 'Other Expenses' is part of operating cost, so it belongs in OpEx. It used to be subtracted
+        # only in the historical EBITDA formula, so the projection engine (which builds EBITDA from
+        # the COGS and OpEx margins only) silently dropped it and overstated projected EBITDA.
+        opex = employee_cost + selling_admin + other_expenses
         
         # Depreciation - IN CRORES
         depreciation = get_value_from_screener_df(df_pl, 'Depreciation', year_col)
@@ -520,7 +523,7 @@ def extract_screener_financials(df_bs, df_pl, year_cols):
         
         # Calculate EBITDA and EBIT
         # EBITDA = Revenue - COGS - OpEx + Other Income - Other Expenses
-        ebitda = revenue - cogs - opex + other_income - other_expenses
+        ebitda = revenue - cogs - opex + other_income  # other_expenses already inside opex (same EBITDA as before)
         
         # EBIT = EBITDA - Depreciation
         ebit = ebitda - depreciation

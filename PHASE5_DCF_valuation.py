@@ -330,7 +330,7 @@ except ImportError as e:
                 
                 return []
             
-            raw_revenue = parse_row_flexible(pl_table, ['revenue'], "Revenue")
+            raw_revenue = parse_row_flexible(pl_table, ['revenue', 'sales'], "Revenue")  # Screener labels it 'Sales' for non-financial cos
             raw_expenses = parse_row_flexible(pl_table, ['expenses'], "Expenses")
             raw_operating_profit = parse_row_flexible(pl_table, ['financing profit', 'operating profit'], "Financing/Operating Profit")
             raw_other_income = parse_row_flexible(pl_table, ['other income'], "Other Income")
@@ -547,13 +547,27 @@ except ImportError as e:
             other_assets = pad(raw_other_assets, n)
             total_assets = pad(raw_total_assets, n)
             
-            # Calculate shares from EPS
+            # Shares: prefer Market Cap / Current Price (printed on the page). Net Profit / EPS
+            # overstates shares when there is minority interest (consolidated profit includes it).
             shares = 0
-            for i in range(n - 1, -1, -1):
-                if eps[i] != 0 and net_profit[i] != 0:
-                    shares = int((net_profit[i] * 10_000_000) / eps[i])
-                    st.success(f"✅ Calculated shares: {shares:,} (from Year {i+1} EPS: ₹{eps[i]:.2f})")
-                    break
+            try:
+                _tr = {}
+                for _li in soup.select('#top-ratios li'):
+                    _n, _v = _li.find(class_='name'), _li.find(class_='number')
+                    if _n and _v:
+                        _tr[_n.get_text(strip=True).lower()] = float(_v.get_text(strip=True).replace(',', ''))
+                _mc, _px = _tr.get('market cap'), _tr.get('current price')
+                if _mc and _px and _px > 0:
+                    shares = int(_mc * 10_000_000 / _px)
+                    st.success(f"✅ Shares: {shares:,} (Market Cap ÷ Price)")
+            except Exception:
+                shares = 0
+            if not shares:
+                for i in range(n - 1, -1, -1):
+                    if eps[i] != 0 and net_profit[i] != 0:
+                        shares = int((net_profit[i] * 10_000_000) / eps[i])
+                        st.success(f"✅ Calculated shares: {shares:,} (from Year {i+1} EPS: ₹{eps[i]:.2f})")
+                        break
             
             # If EPS method failed, try NSEPy
             if shares == 0:
@@ -587,7 +601,7 @@ except ImportError as e:
             if shares == 0:
                 st.warning("⚠️ Could not calculate shares outstanding. Will need manual input.")
             
-            CR_TO_LAC = 10.0
+            CR_TO_LAC = 100.0  # 1 Crore = 100 Lacs (was 10.0 -> every monetary figure 10x too small)
             from datetime import datetime as _dt
             current_year = _dt.now().year
             years_labels = [str(current_year - i) for i in range(n)]
@@ -1219,11 +1233,24 @@ def classify_business_model(financials, income_stmt=None, balance_sheet=None):
             avg_interest_income = np.mean(interest_income) if interest_income else 0
             
             # Criterion 1: Interest Income / Total Revenue ≥ 50%
+            # Screener-sourced data has no interest-income line (stored as 0.0 = 'not available').
+            # In that case criterion 1 can never fire, so use a labelled PROXY instead:
+            # Interest EXPENSE / Revenue ≥ 35% (typical of banks/NBFCs, far above normal operating cos).
             if avg_revenue > 0:
-                interest_income_ratio = (avg_interest_income / avg_revenue) * 100
-                metrics['interest_income_ratio'] = interest_income_ratio
-                if interest_income_ratio >= 50:
-                    criteria_met.append(f"Interest Income / Revenue = {interest_income_ratio:.1f}% (≥50%)")
+                interest_income_available = any(abs(float(x or 0)) > 0 for x in interest_income)
+                if interest_income_available:
+                    interest_income_ratio = (avg_interest_income / avg_revenue) * 100
+                    metrics['interest_income_ratio'] = interest_income_ratio
+                    if interest_income_ratio >= 50:
+                        criteria_met.append(f"Interest Income / Revenue = {interest_income_ratio:.1f}% (≥50%)")
+                else:
+                    interest_expense_to_revenue = (avg_interest_expense / avg_revenue) * 100
+                    metrics['interest_expense_to_revenue'] = interest_expense_to_revenue
+                    metrics['interest_income_available'] = False
+                    if interest_expense_to_revenue >= 35:
+                        criteria_met.append(
+                            f"Interest Expense / Revenue = {interest_expense_to_revenue:.1f}% (≥35%) "
+                            f"[proxy: interest income not available from source]")
             
             # Criterion 2: Interest Expense / Total Expenses ≥ 40%
             # Total Expenses = COGS + Opex + Interest + Depreciation
@@ -4216,7 +4243,16 @@ def project_financials(financials, wc_metrics, years, tax_rate,
     
     if avg_capex_ratio > avg_growth:
         original_capex_ratio = avg_capex_ratio
-        avg_capex_ratio = avg_growth / 4.0
+        # Floor at MAINTENANCE capex (historical depreciation / revenue). Without a floor this rule
+        # could cut CapEx far below depreciation (e.g. 10% -> 1.5% of revenue at 6% growth), which
+        # lets the asset base shrink while revenue grows and inflates FCFF.
+        _dep_ratios = [
+            (financials['depreciation'][i] / financials['revenue'][i]) * 100
+            for i in range(len(revenues))
+            if financials['revenue'][i] > 0 and financials['depreciation'][i] > 0
+        ]
+        maintenance_capex_ratio = float(np.median(_dep_ratios)) if _dep_ratios else 0.0
+        avg_capex_ratio = min(original_capex_ratio, max(avg_growth / 4.0, maintenance_capex_ratio))
         
         # Log the adjustment for transparency
         import streamlit as st
@@ -4227,7 +4263,7 @@ def project_financials(financials, wc_metrics, years, tax_rate,
         
         **Issue Detected:** CapEx ratio ({original_capex_ratio:.2f}%) exceeds revenue growth ({avg_growth:.2f}%)
         
-        **Action Taken:** CapEx ratio normalized to **{avg_capex_ratio:.2f}%** (1/4 of revenue growth)
+        **Action Taken:** CapEx ratio normalized to **{avg_capex_ratio:.2f}%** (the higher of 1/4 of revenue growth and maintenance CapEx = historical depreciation/revenue)
         
         **Rationale:** Sustainable companies cannot indefinitely spend more on CapEx (as % of revenue) 
         than their revenue growth rate. This normalization ensures long-term financial viability.
@@ -4928,12 +4964,17 @@ def calculate_wacc_bank(financials, tax_rate, peer_tickers=None, manual_rf_rate=
         'beta_details': beta_details,
     }
 
-def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shares, cash_balance=0, manual_discount_rate=None):
+def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shares, cash_balance=0, manual_discount_rate=None,
+                            allow_fcff_recovery=True):
     """
-    Calculate DCF valuation with Rulebook-compliant validations and intelligent FCFF recovery
+    Calculate DCF valuation with Rulebook-compliant validations and (optional) FCFF recovery
     
     Args:
         manual_discount_rate: Optional manual override for discount rate (instead of WACC)
+        allow_fcff_recovery: If True (default, interactive UI) a non-positive terminal-year FCFF is
+            replaced by a normalized terminal FCFF for the TERMINAL VALUE only, and the caller's
+            projections are never modified. If False (used by unattended Bulk mode) the function
+            returns an error instead of valuing a company on an invented cash flow.
     """
     # Use manual discount rate if provided, otherwise use WACC
     if manual_discount_rate and manual_discount_rate > 0:
@@ -4972,6 +5013,10 @@ def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shar
     last_fcff = projections['fcff'][-1]
     fcff_adjusted = False
     adjustment_details = {}
+    
+    if last_fcff <= 0 and not allow_fcff_recovery:
+        return None, (f"❌ Terminal-year FCFF is {last_fcff:.2f} Lacs (≤ 0) and FCFF recovery is disabled for this run — "
+                      "a DCF on this company would require inventing a terminal cash flow.")
     
     if last_fcff <= 0:
         # =====================================================
@@ -5217,30 +5262,21 @@ def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shar
                     }
                 })
         
-        # Rank by FCFF value (higher is better, but prefer more conservative approaches)
-        # Preference order: Standard strategies > Ultra-aggressive strategies
-        strategy_preference = {
-            # Standard strategies (highest priority)
-            'Combined: Sustainable CapEx + Normalized WC': 10,
-            'Reduced CapEx to Sustainable Level': 9,
-            'Normalized Working Capital': 8,
-            'Average of Positive Historical FCFFs': 7,
-            'EBITDA-Based Proxy': 6,
-            # Ultra-aggressive strategies (medium priority)
-            'Revenue-Based Proxy (Ultra-Aggressive)': 5,
-            'Growth-Reverse-Engineered (Ultra-Aggressive)': 4,
-            'NOPAT-Based Floor (Ultra-Aggressive)': 3,
-            'Operating Cash Proxy (Ultra-Aggressive)': 2,
-            'Minimum Viable FCFF (Last Resort)': 1,
-            # Emergency fallbacks (lowest priority)
-            'Emergency Fallback (2% of Revenue)': 0.5,
-            'Emergency Fallback (30% of EBITDA)': 0.4,
-            'Absolute Minimum (₹1 Lac)': 0.1
+        # Selection rule: prefer options built from the company's OWN components (capex / working-capital
+        # normalization, its own positive FCFFs, EBITDA conversion). Revenue-only proxies and
+        # emergency fallbacks are used only if no company-derived option exists. Within a tier pick the
+        # LOWEST FCFF (most conservative) - previously the option with the highest hard-coded label
+        # priority won, regardless of how aggressive its FCFF was.
+        _company_derived = {
+            'Combined: Sustainable CapEx + Normalized WC',
+            'Reduced CapEx to Sustainable Level',
+            'Normalized Working Capital',
+            'Average of Positive Historical FCFFs',
+            'EBITDA-Based Proxy',
         }
-        
-        # Sort by preference, then by FCFF value
-        best_option = max(recovery_options, 
-                         key=lambda x: (strategy_preference.get(x['strategy'], 0), x['fcff']))
+        _tier1 = [o for o in recovery_options if o['strategy'] in _company_derived and o['fcff'] > 0]
+        _pool = _tier1 if _tier1 else recovery_options
+        best_option = min(_pool, key=lambda x: x['fcff'])
         
         # Apply the best recovery strategy
         last_fcff = best_option['fcff']
@@ -5264,15 +5300,15 @@ def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shar
                 for key, value in opt['adjustments'].items():
                     st.write(f"  - {key.replace('_', ' ').title()}: {value}")
                 if opt == best_option:
-                    st.success("✅ **SELECTED** (Best balance of conservatism and cash flow)")
+                    st.success("✅ **SELECTED** (most conservative company-derived option)")
                 st.markdown("---")
         
         st.info("💡 **Note:** These adjustments reflect sustainable long-term assumptions required for terminal value calculation.")
         
-        # CRITICAL: Update projections with adjusted terminal FCFF
-        # This ensures all downstream calculations use the recovered value
-        projections['fcff'][-1] = last_fcff
-        st.caption(f"📌 Terminal year FCFF in projections updated to ₹{last_fcff:.2f} Lacs")
+        # NOTE: the caller's projections are intentionally NOT modified. The explicit-period cash
+        # flows stay as projected; the normalized FCFF is used for the terminal value only and is
+        # reported via valuation['adjusted_terminal_fcff'].
+        st.caption(f"📌 Normalized FCFF of ₹{last_fcff:.2f} Lacs is used for the terminal value only; projected FCFFs are unchanged")
     
     # Present Value of FCFFs
     pv_fcffs = []
@@ -5283,25 +5319,15 @@ def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shar
     
     sum_pv_fcff = sum(pv_fcffs)
     
-    # CRITICAL CHECK: If sum of PV(FCFF) is negative, we need additional recovery
-    # This happens when ALL or most FCFFs are negative (high growth/investment phase)
+    # If the explicit-period PV is negative (cash burn during growth), KEEP it. It used to be set to 0,
+    # which ignored real cash burn and overstated value. Terminal value may then legitimately exceed
+    # 100% of EV (see the sanity check below).
     growth_phase_adjusted = False
     original_sum_pv_fcff = sum_pv_fcff
-    
-    if sum_pv_fcff < 0:
-        st.warning(f"⚠️ **Additional Issue Detected:** Sum of PV(FCFF) is negative (₹{sum_pv_fcff:.2f} Lacs)")
-        st.info("🔧 **Applying Growth-Phase Adjustment**: Treating as high-growth company transitioning to maturity")
-        
-        # For high-growth companies, we should focus entirely on terminal value
-        # Set sum_pv_fcff to zero (ignore negative cash flows during growth phase)
-        sum_pv_fcff = 0
-        growth_phase_adjusted = True
-        
-        st.success(f"✅ **Growth-Phase Adjustment Applied:**")
-        st.write(f"   - Original Sum PV(FCFF): ₹{original_sum_pv_fcff:.2f} Lacs (negative due to growth)")
-        st.write(f"   - Adjusted Sum PV(FCFF): ₹{sum_pv_fcff:.2f} Lacs (set to zero)")
-        st.write(f"   - **Rationale:** Company in high-growth phase; value comes from mature cash flows")
-        st.caption("💡 This is common for high-growth companies that invest heavily before generating positive cash flows")
+    negative_pv_fcff = sum_pv_fcff < 0
+    if negative_pv_fcff:
+        st.warning(f"⚠️ Sum of PV(FCFF) over the projection period is negative (₹{sum_pv_fcff:.2f} Lacs): "
+                   "the company burns cash before the terminal year. This burn is deducted from value, not ignored.")
     
     # Terminal Value (Rulebook Section 8.1)
     fcff_n_plus_1 = last_fcff * (1 + g / 100)
@@ -5316,7 +5342,7 @@ def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shar
     # RULEBOOK SECTION 13.1: Terminal Value sanity checks
     tv_percentage = (pv_terminal_value / enterprise_value * 100) if enterprise_value > 0 else 0
     
-    if tv_percentage > 100:
+    if tv_percentage > 100 and not negative_pv_fcff:
         return None, f"❌ ERROR: Terminal Value ({tv_percentage:.1f}%) exceeds 100% of Enterprise Value (Rulebook 13.1)"
     
     # Equity Value Calculation: EV - Net Debt
@@ -5374,6 +5400,7 @@ def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shar
         'sum_pv_fcff': sum_pv_fcff,
         'original_sum_pv_fcff': original_sum_pv_fcff if growth_phase_adjusted else sum_pv_fcff,
         'growth_phase_adjusted': growth_phase_adjusted,
+        'negative_pv_fcff': negative_pv_fcff,
         'terminal_value': terminal_value,
         'pv_terminal_value': pv_terminal_value,
         'enterprise_value': enterprise_value,

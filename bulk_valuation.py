@@ -462,7 +462,9 @@ def _parse_screener_page(soup, num_years: int):
         financials_out["depreciation"].append(dep_val)
         financials_out["ebit"].append(ebit_val)
         financials_out["interest"].append(int_val)
-        financials_out["interest_income"].append(int_val)
+        # Screener does not publish interest income; this used to store interest EXPENSE.
+        # 0.0 = "not available" (classify_business_model falls back to an interest-expense proxy).
+        financials_out["interest_income"].append(0.0)
         financials_out["tax"].append(tax_val)
         financials_out["nopat"].append(nopat_val)
         financials_out["fixed_assets"].append(fa_val)
@@ -728,13 +730,16 @@ def render_bulk_valuation_ui(
                     None, None, None,
                 )
                 wacc_details = calculate_wacc(
-                    financials, tax_rate_pct / 100, peer_tickers=None,
+                    # calculate_wacc() expects a PERCENT (25.17) and divides by 100 itself.
+                    # Passing tax_rate_pct / 100 here zeroed the tax shield (WACC overstated ~0.2-1.0pp).
+                    financials, tax_rate_pct, peer_tickers=None,
                     manual_rf_rate=rf_rate, manual_rm_rate=rm_rate,
                     manual_beta=beta,
                 )
                 cash_balance = financials["cash"][0] if financials["cash"][0] > 0 else 0
                 valuation, dcf_err = calculate_dcf_valuation(
                     projections, wacc_details, terminal_growth, row.shares_outstanding, cash_balance,
+                    allow_fcff_recovery=False,  # unattended batch: never value on an invented terminal FCFF
                 )
 
                 if dcf_err:
